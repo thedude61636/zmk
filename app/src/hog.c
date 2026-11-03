@@ -413,11 +413,37 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
 K_MSGQ_DEFINE(zmk_hog_mouse_msgq, sizeof(struct zmk_hid_mouse_report_body),
               CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE, 4);
 
+/*
+ * High-rate pointer streams can outrun BLE TX: notifications drain roughly one
+ * connection event at a time, and blind-fire draining the msgq silently drops
+ * everything beyond the small ACL TX buffer count whenever reports bunch up
+ * (they always do after any input-thread stall). Keep a failed report in a
+ * pending slot and reschedule instead, so pointer motion is delayed, never
+ * lost. With backpressure in place the producer can use K_NO_WAIT: the input
+ * thread never blocks on a full queue.
+ */
+static struct zmk_hid_mouse_report_body pending_mouse_report;
+static bool pending_mouse_report_valid;
+
+void send_mouse_report_callback(struct k_work *work);
+
+K_WORK_DELAYABLE_DEFINE(hog_mouse_work, send_mouse_report_callback);
+
 void send_mouse_report_callback(struct k_work *work) {
     struct zmk_hid_mouse_report_body report;
-    while (k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT) == 0) {
+
+    if (pending_mouse_report_valid) {
+        report = pending_mouse_report;
+        pending_mouse_report_valid = false;
+    } else if (k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT) != 0) {
+        return;
+    }
+
+    while (true) {
         struct bt_conn *conn = zmk_ble_active_profile_conn();
         if (conn == NULL) {
+            /* Disconnected: this motion is stale. */
+            pending_mouse_report_valid = false;
             return;
         }
 
@@ -429,34 +455,50 @@ void send_mouse_report_callback(struct k_work *work) {
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
         if (err == -EPERM) {
+            /* Not encrypted yet; retry this report once pairing proceeds. */
             bt_conn_set_security(conn, BT_SECURITY_L2);
+            bt_conn_unref(conn);
+            pending_mouse_report = report;
+            pending_mouse_report_valid = true;
+            k_work_reschedule_for_queue(&hog_work_q, &hog_mouse_work, K_MSEC(20));
+            return;
+        }
+        bt_conn_unref(conn);
+        if (err == -ENOMEM || err == -EAGAIN || err == -EBUSY) {
+            /* TX buffers still in flight at the current connection event:
+             * hold the report and retry shortly rather than dropping it. */
+            LOG_DBG("TX busy, deferring mouse report (%d)", err);
+            pending_mouse_report = report;
+            pending_mouse_report_valid = true;
+            k_work_reschedule_for_queue(&hog_work_q, &hog_mouse_work, K_MSEC(5));
+            return;
         } else if (err) {
             LOG_DBG("Error notifying %d", err);
         }
 
-        bt_conn_unref(conn);
+        if (k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT) != 0) {
+            return;
+        }
     }
 };
 
-K_WORK_DEFINE(hog_mouse_work, send_mouse_report_callback);
-
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
-    int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_MSEC(100));
-    if (err) {
-        switch (err) {
-        case -EAGAIN: {
-            LOG_WRN("Consumer message queue full, popping first message and queueing again");
-            struct zmk_hid_mouse_report_body discarded_report;
-            k_msgq_get(&zmk_hog_mouse_msgq, &discarded_report, K_NO_WAIT);
-            return zmk_hog_send_mouse_report(report);
-        }
-        default:
-            LOG_WRN("Failed to queue mouse report to send (%d)", err);
-            return err;
-        }
+    int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_NO_WAIT);
+    if (err == -EAGAIN) {
+        /* Queue full: drop the OLDEST queued report and keep the newest --
+         * latest motion wins, and the input thread is never blocked here. */
+        LOG_WRN("Mouse queue full, dropping oldest report");
+        struct zmk_hid_mouse_report_body discarded_report;
+        k_msgq_get(&zmk_hog_mouse_msgq, &discarded_report, K_NO_WAIT);
+        err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_NO_WAIT);
     }
 
-    k_work_submit_to_queue(&hog_work_q, &hog_mouse_work);
+    if (err) {
+        LOG_WRN("Failed to queue mouse report to send (%d)", err);
+        return err;
+    }
+
+    k_work_schedule_for_queue(&hog_work_q, &hog_mouse_work, K_NO_WAIT);
 
     return 0;
 };
